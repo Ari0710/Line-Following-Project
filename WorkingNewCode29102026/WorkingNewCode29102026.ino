@@ -55,6 +55,8 @@ const int MAX_PWM = 180;
 const int MIN_PWM = 0;
 const unsigned long CALIBRATION_TIME_MS = 3500;
 const unsigned long DEBOUNCE_MS = 35;
+const unsigned long BLACK_BOX_CONFIRM_MS = 250;
+const unsigned long LINE_LOST_TIMEOUT_MS = 1500;
 
 // ---------------- STATE ----------------
 int sensorRaw[NUM_SENSORS];
@@ -156,6 +158,13 @@ bool lineDetected() {
     if (sensorOnLine[i]) return true;
   }
   return false;
+}
+
+bool allSensorsOnBlack() {
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    if (!sensorOnLine[i]) return false;
+  }
+  return true;
 }
 
 // Weighted line error: approximately +3 (far left) to -3 (far right).
@@ -282,8 +291,10 @@ void runLineFollower(bool dryRun) {
   previousError = 0;
   digitalWrite(LED_PIN, HIGH);
 
+  unsigned long allBlackSince = 0;
+  unsigned long lineLostSince = 0;
+
   while (true) {
-    // Either run button stops the active mode.
     if (digitalRead(BTN_DRYRUN) == LOW || digitalRead(BTN_MAIN) == LOW) {
       delay(DEBOUNCE_MS);
       if (digitalRead(BTN_DRYRUN) == LOW || digitalRead(BTN_MAIN) == LOW) {
@@ -294,20 +305,44 @@ void runLineFollower(bool dryRun) {
     }
 
     readSensors();
-    float weightedError = 0.0;
 
+    // Stop only when ALL seven sensors see black continuously.
+    if (allSensorsOnBlack()) {
+      if (allBlackSince == 0) allBlackSince = millis();
+      if (millis() - allBlackSince >= BLACK_BOX_CONFIRM_MS) {
+        stopMotors();
+        Serial.println(F("BLACK END BOX DETECTED: motors stopped."));
+        while (true) {
+          digitalWrite(LED_PIN, HIGH);
+          delay(250);
+          digitalWrite(LED_PIN, LOW);
+          delay(250);
+        }
+      }
+    } else {
+      allBlackSince = 0;
+    }
+
+    float weightedError = 0.0;
     if (!getLineError(weightedError)) {
-      // Line lost: pivot toward the side where it was last seen.
+      if (lineLostSince == 0) lineLostSince = millis();
+      if (millis() - lineLostSince >= LINE_LOST_TIMEOUT_MS) {
+        stopMotors();
+        Serial.println(F("LINE LOST: recovery timed out, motors stopped."));
+        break;
+      }
+
       if (lastSeenSide < 0) driveMotors(-turnSpeed, turnSpeed);
       else if (lastSeenSide > 0) driveMotors(turnSpeed, -turnSpeed);
       else stopMotors();
+      delay(2);
       continue;
     }
 
-    // Positive weighted error means the line is left; negative means right.
+    lineLostSince = 0;
     errorValue = weightedError;
-    if (errorValue > 0) lastSeenSide = -1;  // line last seen left
-    else if (errorValue < 0) lastSeenSide = 1; // line last seen right
+    if (errorValue > 0) lastSeenSide = -1;
+    else if (errorValue < 0) lastSeenSide = 1;
 
     float derivative = errorValue - previousError;
     float correction = Kp * errorValue + Kd * derivative;
@@ -315,7 +350,6 @@ void runLineFollower(bool dryRun) {
 
     int left = constrain((int)(speed - correction), MIN_PWM, MAX_PWM);
     int right = constrain((int)(speed + correction), MIN_PWM, MAX_PWM);
-
     driveMotors(left, right);
   }
 
